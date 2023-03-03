@@ -1,0 +1,14 @@
+[package]
+name = "rust-vm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rusty_vdbe"
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+num_enum = "0.5.10"

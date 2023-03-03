@@ -55,3 +55,4 @@ test-out.txt
 test/rust_suite/target
 testfixture
 libsql
+rust-vm/target
