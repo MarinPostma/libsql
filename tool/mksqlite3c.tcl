@@ -119,7 +119,7 @@ if {$addstatic} {
 # Examine the parse.c file.  If it contains lines of the form:
 #
 #    "#ifndef SQLITE_ENABLE_UPDATE_LIMIT
-# 
+#
 # then set the SQLITE_UDL_CAPABLE_PARSER flag in the amalgamation.
 #
 set in [open $srcdir/parse.c]
@@ -451,7 +451,9 @@ set flist {
    sqlite3session.c
    fts5.c
    stmt.c
-} 
+
+   replication.c
+}
 if {$enable_recover} {
   lappend flist sqlite3recover.c dbdata.c
 }

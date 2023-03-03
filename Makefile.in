@@ -197,7 +197,7 @@ LIBOBJS0 = alter.lo analyze.lo attach.lo auth.lo \
          vdbe.lo vdbeapi.lo vdbeaux.lo vdbeblob.lo vdbemem.lo vdbesort.lo \
          vdbetrace.lo vdbevtab.lo \
          wal.lo walker.lo where.lo wherecode.lo whereexpr.lo \
-         window.lo utf.lo vtab.lo
+         window.lo utf.lo vtab.lo replication.lo
 
 # Object files for the amalgamation.
 #
@@ -316,7 +316,8 @@ SRC = \
   $(TOP)/src/wherecode.c \
   $(TOP)/src/whereexpr.c \
   $(TOP)/src/whereInt.h \
-  $(TOP)/src/window.c
+  $(TOP)/src/window.c \
+  $(TOP)/src/replication.c
 
 # Source code for extensions
 #
