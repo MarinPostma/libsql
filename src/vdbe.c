@@ -712,9 +712,13 @@ FuncDef *try_instantiate_wasm_function(sqlite3 *db, const char *pName, int nName
 int deregister_wasm_function(sqlite3 *db, const char *zName);
 #endif
 
-extern void* replication_state_init();
-extern int replication_step(void*, Op*, Vdbe*);
-extern void replication_state_destroy(void*);
+extern int replication_step(Vdbe*, Op*);
+
+// step the replication machine before incrementing the op.
+static void increment_pOp(Op *pOp, Vdbe *v) {
+    replication_step(v, pOp);
+    pOp++;
+}
 
 /*
 ** Execute as much of a VDBE program as we can.
@@ -723,7 +727,6 @@ extern void replication_state_destroy(void*);
 int sqlite3VdbeExec(
   Vdbe *p                    /* The VDBE */
 ){
-    void* replication_state = replication_state_init();
   Op *aOp = p->aOp;          /* Copy of p->aOp */
   Op *pOp = aOp;             /* Current operation */
 #ifdef SQLITE_DEBUG
@@ -805,13 +808,12 @@ int sqlite3VdbeExec(
   sqlite3EndBenignMalloc();
 #endif
 
-  for(pOp=&aOp[p->pc]; 1; pOp++){
+  for(pOp=&aOp[p->pc]; 1; increment_pOp(pOp, p)){
     /* Errors are detected by individual opcodes, with an immediate
     ** jumps to abort_due_to_error. */
     assert( rc==SQLITE_OK );
 
     assert( pOp>=aOp && pOp<&aOp[p->nOp]);
-    replication_step(replication_state, pOp, p);
     nVmStep++;
 #if defined(SQLITE_ENABLE_STMT_SCANSTATUS) || defined(VDBE_PROFILE)
     pOp->nExec++;
@@ -8925,7 +8927,6 @@ abort_due_to_error:
   ** release the mutexes on btrees that were acquired at the
   ** top. */
 vdbe_return:
-    replication_state_destroy(replication_state);
 #if defined(VDBE_PROFILE)
   if( pnCycle ){
     *pnCycle += sqlite3NProfileCnt ? sqlite3NProfileCnt : sqlite3Hwtime();

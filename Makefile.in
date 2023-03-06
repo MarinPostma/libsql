@@ -633,6 +633,7 @@ ST_OPT = -DSQLITE_OS_KV_OPTIONAL
 # are what get build when you type just "make" with no arguments.
 #
 all:	sqlite3.h libsqlite3.la sqlite3$(TEXE) libsql$(TEXE) $(HAVE_TCL:1=libtclsqlite3.la)
+	echo $(OPTS) > flags
 
 Makefile: $(TOP)/Makefile.in
 	./config.status

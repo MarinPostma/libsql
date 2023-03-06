@@ -12,3 +12,6 @@ crate-type = ["staticlib"]
 
 [dependencies]
 num_enum = "0.5.10"
+
+[build-dependencies]
+bindgen = "0.53"

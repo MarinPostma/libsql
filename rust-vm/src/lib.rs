@@ -1,9 +1,21 @@
 #![allow(dead_code)]
-use std::ffi::{c_char, c_double, c_int, c_void, CStr};
-use std::fmt;
+
+use std::collections::HashMap;
+use std::ffi::{c_int, c_void, CStr};
 
 use num_enum::TryFromPrimitive;
+
+use ffi::{Mem, Vdbe, VdbeOp};
+
 const SQLITE_INTERNAL: usize = 2;
+
+pub mod ffi {
+    #![allow(non_upper_case_globals)]
+    #![allow(non_camel_case_types)]
+    #![allow(non_snake_case)]
+    #![allow(improper_ctypes)]
+    include!(concat!(env!("OUT_DIR"), "/sqliteInt.rs"));
+}
 
 #[derive(Debug)]
 enum Value {
@@ -32,18 +44,34 @@ struct Row {
 #[derive(Debug)]
 enum Op {
     Transaction,
-    Record { id: u32, table: String, row: Row },
+    Record {
+        id: u32,
+        /// A number representing the root of the tree into which to insert the row.
+        /// Since there is no guarantee over what will be the actual root page returned by the
+        /// execution of OP_CreateBtree, we store an offset instead: the first call to CreateBTree
+        /// has offset 0, etc...
+        /// When restoring from a log, one has to convert this offset into an actual root offset.
+        root: i32,
+        data: Vec<i8>,
+    },
+    CreateBTree(usize),
 }
 
 #[derive(Debug)]
 struct ReplicationState {
-    stack: Vec<Op>,
+    /// maps a register to a node in the current context
+    btree_root_remap: HashMap<i32, i32>,
+    cursor_to_root: HashMap<i32, i32>,
+    buffer: Vec<Op>,
 }
 
 #[no_mangle]
 pub extern "C" fn replication_state_init() -> *mut c_void {
-    dbg!(std::mem::size_of::<Mem>());
-    let state = Box::new(ReplicationState { stack: Vec::new() });
+    let state = Box::new(ReplicationState {
+        buffer: Vec::new(),
+        btree_root_remap: HashMap::new(),
+        cursor_to_root: HashMap::new(),
+    });
 
     println!("created state with value: {state:?}");
 
@@ -173,29 +201,52 @@ fn decode_record(data: &[i8]) {
 }
 
 #[no_mangle]
-pub extern "C" fn replication_step(
-    state: *mut c_void,
-    op: *const VdbeOp,
-    vdbe: *const Vdbe,
-) -> c_int {
-    let state = unsafe { &mut *(state as *mut ReplicationState) };
+pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_int {
+    let vdbe = unsafe { &*vdbe };
+    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
     let op = unsafe { &*op };
     let code: OpCode = op.opcode.try_into().unwrap();
     match code {
         OpCode::OpTransaction => {
-            state.stack.push(Op::Transaction);
+            state.buffer.push(Op::Transaction);
+        }
+        OpCode::OpCreateBtree => {
+            dbg!("created btree");
+            let root = unsafe { vdbe.vdbe_get_reg(op.p2).u.i };
+            let root_remap_id = state.btree_root_remap.len();
+            state
+                .btree_root_remap
+                .insert(root as i32, root_remap_id as i32);
+            state.buffer.push(Op::CreateBTree(root_remap_id))
+        }
+        OpCode::OpOpenWrite => {
+            // p1 contains a cursor for the table/index whose root is in p2. We create the mapping
+            state.cursor_to_root.insert(op.p1, op.p2);
         }
         OpCode::OpInsert => {
+            // p1 contains the cursor we want to insert to, we get the corresponding table root
+            // mapping
+            let root = state
+                .cursor_to_root
+                .get(&op.p1)
+                .expect("unknown cursor root!");
+            let mapped_root = state.btree_root_remap.get(&root).expect("unkown root!");
             if op.p4type == P4_TABLE {
                 let table = unsafe { &op.p4.pTab };
                 let name = unsafe { CStr::from_ptr((**table).zName) };
                 println!("inserting into {name:?}");
             }
 
-            let reg_id = op.p2 as isize;
-            let reg = unsafe { &(*(*vdbe).aMem.offset(reg_id)) };
-            let data = unsafe { std::slice::from_raw_parts(reg.z, reg.n as usize) };
+            let id = unsafe { vdbe.vdbe_get_reg(op.p3).u.i as u32 };
+
+            let data_reg = vdbe.vdbe_get_reg(op.p2);
+            let data = unsafe { std::slice::from_raw_parts(data_reg.z, data_reg.n as usize) };
             decode_record(data);
+            state.buffer.push(Op::Record {
+                id,
+                root: *mapped_root,
+                data: data.to_vec(),
+            })
         }
         _ => (),
     }
@@ -203,86 +254,12 @@ pub extern "C" fn replication_step(
     0
 }
 
-#[allow(dead_code, non_snake_case)]
-#[repr(C)]
-pub struct Vdbe {
-    db: *const c_void,
-    ppVPrev: *const *const Vdbe,
-    pVNext: *const Vdbe,
-    pParse: *const c_void,
-    nVar: c_int,
-    nMem: c_int,
-    nCursor: c_int,
-    cacheCstr: u32,
-    pc: c_int,
-    rc: c_int,
-    nChange: i64,
-    iStatement: c_int,
-    iCurrentTime: i64,
-    nFkConstraint: i64,
-    nStmtDefCons: i64,
-    nStmtDefImmCons: i64,
-    aMem: *const Mem,
-    apArg: *const *const Mem,
-    // there are more fields I don't care about.
-}
-
-#[repr(C)]
-union MemValue {
-    r: c_double,
-    i: i64,
-    nZero: c_int,
-    zPType: *const c_char,
-    pDef: *const c_void,
-}
-
-#[allow(dead_code, non_snake_case)]
-#[repr(C)]
-struct Mem {
-    u: MemValue,
-    z: *const c_char,
-    n: c_int,
-    flags: u16,
-    enc: u8,
-    eSubtype: u8,
-    db: *const c_void,
-    szMalloc: c_int,
-    uTemp: u32,
-    zMalloc: *const c_char,
-    xDel: *const c_void,
-    // #ifdef SQLITE_DEBUG
-    //   Mem *pScopyFrom;    /* This Mem is a shallow copy of pScopyFrom */
-    //   u16 mScopyFlags;    /* flags value immediately after the shallow copy */
-    // #endif
-}
-
-#[repr(C)]
-struct Table {
-    zName: *const c_char,
-}
-
-#[repr(C)]
-union P4union {
-    /* fourth parameter */
-    i: c_int,                /* Integer value if p4type==P4_INT32 */
-    p: *const c_void,        /* Generic pointer */
-    z: *const c_char,        /* Pointer to data for string (char array) types */
-    pI64: *const i64,        /* Used when p4type is P4_INT64 */
-    pReal: *const c_double,  /* Used when p4type is P4_REAL */
-    pFunc: *const c_void,    /* Used when p4type is P4_FUNCDEF */
-    pCtx: *const c_void,     /* Used when p4type is P4_FUNCCTX */
-    pColl: *const c_void,    /* Used when p4type is P4_COLLSEQ */
-    pMem: *const c_void,     /* Used when p4type is P4_MEM */
-    pVtab: *const c_void,    /* Used when p4type is P4_VTAB */
-    pKeyInfo: *const c_void, /* Used when p4type is P4_KEYINFO */
-    ai: *const u32,          /* Used when p4type is P4_INTARRAY */
-    pProgram: *const c_void, /* Used when p4type is P4_SUBPROGRAM */
-    pTab: *const Table,      /* Used when p4type is P4_TABLE */
-}
-
-impl fmt::Debug for P4union {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("p4")
+impl Vdbe {
+    fn vdbe_get_reg(&self, index: i32) -> &Mem {
+        if index >= self.nMem {
+            panic!("register {index} out of bound")
+        }
+        unsafe { &(*self.aMem.offset(index as isize)) }
     }
 }
 
@@ -304,19 +281,6 @@ const P4_REAL: i8 = -12; /* P4 is a 64-bit floating point value */
 const P4_INT64: i8 = -13; /* P4 is a 64-bit signed integer */
 const P4_INTARRAY: i8 = -14; /* P4 is a vector of 32-bit integers */
 const P4_FUNCCTX: i8 = -15; /* P4 is a pointer to an sqlite3_context object */
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct VdbeOp {
-    opcode: u8,  /* What operation to perform */
-    p4type: i8,  /* One of the P4_xxx constants for p4 */
-    p5: u16,     /* Fifth parameter is an unsigned 16-bit integer */
-    p1: c_int,   /* First operand */
-    p2: c_int,   /* Second parameter (often the jump destination) */
-    p3: c_int,   /* The third parameter */
-    p4: P4union, /* The 4th parameter */
-    _pad: u64,   // dunno what this is
-}
 
 #[derive(Debug, TryFromPrimitive, Clone, Copy)]
 #[repr(u8)]
