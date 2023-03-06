@@ -716,6 +716,7 @@ extern int replication_step(Vdbe*, Op*);
 
 // step the replication machine before incrementing the op.
 static void increment_pOp(Op *pOp, Vdbe *v) {
+    printf("hello\n");
     replication_step(v, pOp);
     pOp++;
 }
@@ -808,7 +809,16 @@ int sqlite3VdbeExec(
   sqlite3EndBenignMalloc();
 #endif
 
-  for(pOp=&aOp[p->pc]; 1; increment_pOp(pOp, p)){
+  Op* previous = NULL;
+  for(pOp=&aOp[p->pc]; 1; pOp++){
+    /* 
+     * Apply the replication with the previously executed op, so we can observe its effects
+     */
+    if (previous) {
+        replication_step(p, previous);
+    }
+
+    previous = pOp;
     /* Errors are detected by individual opcodes, with an immediate
     ** jumps to abort_due_to_error. */
     assert( rc==SQLITE_OK );

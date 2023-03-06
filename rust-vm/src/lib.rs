@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use core::fmt::{self, Display};
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void, CStr};
 
@@ -27,7 +28,6 @@ enum ReturnCode {
     SqliteRow,
 }
 
-#[derive(Debug)]
 enum RowValue {
     String(String),
     Integer(u64),
@@ -36,9 +36,40 @@ enum RowValue {
     Null,
 }
 
+impl fmt::Debug for RowValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::String(s) => write!(f, "'{s}'"),
+            Self::Integer(n) => write!(f, "{n}"),
+            Self::Blob(b) => {
+                #[allow(deprecated)]
+                let b64 = base64::encode(b);
+                write!(f, "b64:{b64}")
+            }
+            Self::Float(x) => write!(f, "{x}"),
+            Self::Null => write!(f, "Null"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Row {
     values: Vec<RowValue>,
+}
+
+#[derive(Debug)]
+enum TableRoot {
+    System,
+    User(i32),
+}
+
+impl Display for TableRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TableRoot::System => write!(f, "system"),
+            TableRoot::User(i) => write!(f, "{i}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -51,39 +82,97 @@ enum Op {
         /// execution of OP_CreateBtree, we store an offset instead: the first call to CreateBTree
         /// has offset 0, etc...
         /// When restoring from a log, one has to convert this offset into an actual root offset.
-        root: i32,
+        root: TableRoot,
         data: Vec<i8>,
     },
     CreateBTree(usize),
+}
+
+struct Trace {
+    ops: Vec<Op>,
+}
+
+impl Trace {
+    fn new() -> Self {
+        Self { ops: Vec::new() }
+    }
+    fn clear(&mut self) {
+        self.ops.clear();
+    }
+
+    fn push(&mut self, op: Op) {
+        self.ops.push(op);
+    }
+}
+
+impl fmt::Debug for Trace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for op in self.ops.iter() {
+            match op {
+                Op::Transaction => writeln!(f, "TX_BEGIN")?,
+                Op::Record { id, root, data } => {
+                    let row = decode_record(&data);
+                    writeln!(f, "INSERT root={root} id={id} row={row:?}")?;
+                }
+                Op::CreateBTree(i) => writeln!(f, "CREATE_BTREE root={i}")?,
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Context {
+    cursor_to_root: HashMap<i32, i32>,
+    trace: Trace,
 }
 
 #[derive(Debug)]
 struct ReplicationState {
     /// maps a register to a node in the current context
     btree_root_remap: HashMap<i32, i32>,
-    cursor_to_root: HashMap<i32, i32>,
-    buffer: Vec<Op>,
+    contexts: HashMap<usize, Context>,
 }
 
 #[no_mangle]
 pub extern "C" fn replication_state_init() -> *mut c_void {
     let state = Box::new(ReplicationState {
-        buffer: Vec::new(),
         btree_root_remap: HashMap::new(),
-        cursor_to_root: HashMap::new(),
+        contexts: HashMap::new(),
     });
-
-    println!("created state with value: {state:?}");
 
     let ptr = Box::leak(state) as *mut _;
 
     ptr as _
 }
 
+/// Enter a vdbe context. Returns a new context_id
+#[no_mangle]
+pub extern "C" fn replication_enter_context(vdbe: const* Vdbe) -> c_int {
+    let vdbe = unsafe { &*vdbe };
+    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    let ctx_id = state.contexts.len();
+}
+
 #[no_mangle]
 pub extern "C" fn replication_state_destroy(state: *mut c_void) {
     let state: Box<ReplicationState> = unsafe { Box::from_raw(state as *mut ReplicationState) };
-    println!("destroying state: {state:?}");
+}
+
+#[no_mangle]
+pub extern "C" fn replication_post_commit_cleanup(vdbe: *mut Vdbe) {
+    let vdbe = unsafe { &*vdbe };
+    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    state.trace.clear();
+}
+
+#[no_mangle]
+pub extern "C" fn replication_pre_commit(vdbe: *const Vdbe) -> c_int {
+    let vdbe = unsafe { &*vdbe };
+    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    println!("Trace:\n {:?}", state.trace);
+    0
 }
 
 #[derive(Debug)]
@@ -142,7 +231,7 @@ impl RecordType {
     }
 }
 
-fn decode_record(data: &[i8]) {
+fn decode_record(data: &[i8]) -> Vec<RowValue> {
     let (data_offset, ty_offset) = sqlite_get_var_int(data);
     let mut ty_slice = &data[ty_offset as usize..data_offset as usize];
     let mut data_slice =
@@ -197,7 +286,7 @@ fn decode_record(data: &[i8]) {
         data_slice = &data_slice[data_len..];
     }
 
-    dbg!(row);
+    row
 }
 
 #[no_mangle]
@@ -208,16 +297,15 @@ pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_in
     let code: OpCode = op.opcode.try_into().unwrap();
     match code {
         OpCode::OpTransaction => {
-            state.buffer.push(Op::Transaction);
+            state.trace.push(Op::Transaction);
         }
         OpCode::OpCreateBtree => {
-            dbg!("created btree");
             let root = unsafe { vdbe.vdbe_get_reg(op.p2).u.i };
             let root_remap_id = state.btree_root_remap.len();
             state
                 .btree_root_remap
                 .insert(root as i32, root_remap_id as i32);
-            state.buffer.push(Op::CreateBTree(root_remap_id))
+            state.trace.push(Op::CreateBTree(root_remap_id))
         }
         OpCode::OpOpenWrite => {
             // p1 contains a cursor for the table/index whose root is in p2. We create the mapping
@@ -230,7 +318,12 @@ pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_in
                 .cursor_to_root
                 .get(&op.p1)
                 .expect("unknown cursor root!");
-            let mapped_root = state.btree_root_remap.get(&root).expect("unkown root!");
+            let root = if *root == 1 {
+                TableRoot::System
+            } else {
+                let mapped_root = state.btree_root_remap.get(&root).expect("unkown root!");
+                TableRoot::User(*mapped_root)
+            };
             if op.p4type == P4_TABLE {
                 let table = unsafe { &op.p4.pTab };
                 let name = unsafe { CStr::from_ptr((**table).zName) };
@@ -241,10 +334,9 @@ pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_in
 
             let data_reg = vdbe.vdbe_get_reg(op.p2);
             let data = unsafe { std::slice::from_raw_parts(data_reg.z, data_reg.n as usize) };
-            decode_record(data);
-            state.buffer.push(Op::Record {
+            state.trace.push(Op::Record {
                 id,
-                root: *mapped_root,
+                root,
                 data: data.to_vec(),
             })
         }

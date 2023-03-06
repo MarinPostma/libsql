@@ -633,7 +633,6 @@ ST_OPT = -DSQLITE_OS_KV_OPTIONAL
 # are what get build when you type just "make" with no arguments.
 #
 all:	sqlite3.h libsqlite3.la sqlite3$(TEXE) libsql$(TEXE) $(HAVE_TCL:1=libtclsqlite3.la)
-	echo $(OPTS) > flags
 
 Makefile: $(TOP)/Makefile.in
 	./config.status
@@ -645,6 +644,9 @@ libsqlite3.la:	$(LIBOBJ)
 	$(LTLINK) -no-undefined -o $@ $(LIBOBJ) $(TLIBS) \
 		${ALLOWRELEASE} -rpath "$(libdir)" -version-info "8:6:8"
 
+librusty_vdbe.a:
+	cargo b --manifest-path rust-vm/Cargo.toml
+
 libtclsqlite3.la:	tclsqlite.lo libsqlite3.la
 	$(LTLINK) -no-undefined -o $@ tclsqlite.lo \
 		libsqlite3.la @TCL_STUB_LIB_SPEC@ $(TLIBS) \
@@ -652,7 +654,7 @@ libtclsqlite3.la:	tclsqlite.lo libsqlite3.la
 		-version-info "8:6:8" \
 		-avoid-version
 
-sqlite3$(TEXE):	shell.c sqlite3.c
+sqlite3$(TEXE):	shell.c sqlite3.c librusty_vdbe.a
 	$(LTLINK) $(READLINE_FLAGS) $(SHELL_OPT) -o $@ \
 		shell.c sqlite3.c \
 		$(LIBREADLINE) $(TLIBS) -rpath "$(libdir)"
