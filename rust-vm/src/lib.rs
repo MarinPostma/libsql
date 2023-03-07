@@ -5,8 +5,12 @@ use std::collections::HashMap;
 use std::ffi::{c_int, c_void, CStr};
 
 use num_enum::TryFromPrimitive;
+use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
-use ffi::{Mem, Vdbe, VdbeOp};
+use ffi::{sqlite3, Mem, Vdbe, VdbeOp};
 
 const SQLITE_INTERNAL: usize = 2;
 
@@ -57,7 +61,7 @@ struct Row {
     values: Vec<RowValue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum TableRoot {
     System,
     User(i32),
@@ -72,7 +76,7 @@ impl Display for TableRoot {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum Op {
     Transaction,
     Record {
@@ -85,9 +89,15 @@ enum Op {
         root: TableRoot,
         data: Vec<i8>,
     },
+    SetCookie {
+        db: i32,
+        value: i32,
+        cookie: i32,
+    },
     CreateBTree(usize),
 }
 
+#[derive(Default)]
 struct Trace {
     ops: Vec<Op>,
 }
@@ -115,6 +125,9 @@ impl fmt::Debug for Trace {
                     writeln!(f, "INSERT root={root} id={id} row={row:?}")?;
                 }
                 Op::CreateBTree(i) => writeln!(f, "CREATE_BTREE root={i}")?,
+                Op::SetCookie { db, value, cookie } => {
+                    writeln!(f, "SET_COOKIE db={db}, value={value}, cookie={cookie}")?;
+                }
             }
         }
 
@@ -122,7 +135,7 @@ impl fmt::Debug for Trace {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Context {
     cursor_to_root: HashMap<i32, i32>,
     trace: Trace,
@@ -132,15 +145,91 @@ struct Context {
 struct ReplicationState {
     /// maps a register to a node in the current context
     btree_root_remap: HashMap<i32, i32>,
-    contexts: HashMap<usize, Context>,
+    contexts: HashMap<i32, Context>,
+    context_stack: Vec<i32>,
+    context_ids: i32,
+    logger: mpsc::Sender<Op>,
+}
+
+impl ReplicationState {
+    fn in_context(&self) -> bool {
+        !self.context_stack.is_empty()
+    }
+    fn current_context_mut(&mut self) -> &mut Context {
+        let ctx_id = self
+            .context_stack
+            .last()
+            .expect("replication method called out of any context");
+        self.contexts
+            .get_mut(dbg!(ctx_id))
+            .expect("invalid replication state")
+    }
+}
+
+async fn update_conn(conn: &mut (usize, TcpStream), log: &[Op]) -> bool {
+    let to_send = &log[conn.0..];
+    let mut sent = 0;
+    for op in to_send {
+        let data = bincode::serialize(op).unwrap();
+        if conn.1.write_all(&data).await.is_err() {
+            return false;
+        }
+
+        sent += 1;
+    }
+
+    conn.0 += sent;
+
+    true
+}
+
+fn serve_log(mut rcv: mpsc::Receiver<Op>) {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let mut log = Vec::new();
+        let listener = TcpListener::bind("127.0.0.1:7890").await.unwrap();
+        dbg!();
+        let mut conns = Vec::new();
+        loop {
+            tokio::select! {
+                Some(e) = rcv.recv() => {
+                    log.push(e);
+                    let mut to_remove = Vec::new();
+                    for (i, conn) in conns.iter_mut().enumerate() {
+                        if !update_conn(conn, &log).await {
+                            to_remove.push(i);
+                        }
+                    }
+
+                    for i in to_remove {
+                        conns.remove(i);
+                    }
+                },
+                Ok((s, _)) = listener.accept() => {
+                    dbg!();
+                    let mut conn = (0, s);
+                    if update_conn(&mut conn, &log).await {
+                        conns.push(conn);
+                    }
+                },
+                else => break
+            }
+        }
+    });
 }
 
 #[no_mangle]
 pub extern "C" fn replication_state_init() -> *mut c_void {
+    let (sender, receiver) = mpsc::channel(512);
     let state = Box::new(ReplicationState {
         btree_root_remap: HashMap::new(),
         contexts: HashMap::new(),
+        context_stack: Vec::new(),
+        context_ids: 0,
+        logger: sender,
     });
+
+    std::thread::spawn(move || serve_log(receiver));
 
     let ptr = Box::leak(state) as *mut _;
 
@@ -149,30 +238,61 @@ pub extern "C" fn replication_state_init() -> *mut c_void {
 
 /// Enter a vdbe context. Returns a new context_id
 #[no_mangle]
-pub extern "C" fn replication_enter_context(vdbe: const* Vdbe) -> c_int {
+pub extern "C" fn replication_enter_context(vdbe: *const Vdbe) {
+    println!("entering context");
+    let vdbe = unsafe { &*vdbe };
+    // we are only interested in writes
+    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    // this is not good, we need a proper id
+    let ctx_id = state.context_ids;
+    state.context_ids = state.context_ids.wrapping_add(1);
+
+    let ctx = Context::default();
+    state.contexts.insert(ctx_id, ctx);
+    state.context_stack.push(dbg!(ctx_id));
+}
+
+#[no_mangle]
+pub extern "C" fn replication_exit_context(vdbe: *const Vdbe) {
+    println!("exiting context");
     let vdbe = unsafe { &*vdbe };
     let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
-    let ctx_id = state.contexts.len();
+    if state.in_context() {
+        let last = state.context_stack.pop().unwrap();
+        state.contexts.remove(dbg!(&last));
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn replication_state_destroy(state: *mut c_void) {
-    let state: Box<ReplicationState> = unsafe { Box::from_raw(state as *mut ReplicationState) };
+    let _state: Box<ReplicationState> = unsafe { Box::from_raw(state as *mut ReplicationState) };
 }
 
 #[no_mangle]
 pub extern "C" fn replication_post_commit_cleanup(vdbe: *mut Vdbe) {
     let vdbe = unsafe { &*vdbe };
-    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
-    state.trace.clear();
+    let _state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    println!("post commit called");
 }
 
 #[no_mangle]
 pub extern "C" fn replication_pre_commit(vdbe: *const Vdbe) -> c_int {
     let vdbe = unsafe { &*vdbe };
     let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
-    println!("Trace:\n {:?}", state.trace);
+    if state.in_context() {
+        let ctx = state.current_context_mut();
+        println!("Trace:\n {:?}", ctx.trace);
+        let trace = std::mem::take(&mut ctx.trace);
+        for op in trace.ops {
+            state.logger.blocking_send(op).unwrap();
+        }
+    }
     0
+}
+
+// takes a db and apply a stream of logical frames to it.
+pub fn replicate(_db: *mut sqlite3) {
+    todo!()
 }
 
 #[derive(Debug)]
@@ -293,11 +413,14 @@ fn decode_record(data: &[i8]) -> Vec<RowValue> {
 pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_int {
     let vdbe = unsafe { &*vdbe };
     let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    if !state.in_context() {
+        return 0;
+    }
     let op = unsafe { &*op };
     let code: OpCode = op.opcode.try_into().unwrap();
     match code {
         OpCode::OpTransaction => {
-            state.trace.push(Op::Transaction);
+            state.current_context_mut().trace.push(Op::Transaction);
         }
         OpCode::OpCreateBtree => {
             let root = unsafe { vdbe.vdbe_get_reg(op.p2).u.i };
@@ -305,20 +428,37 @@ pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_in
             state
                 .btree_root_remap
                 .insert(root as i32, root_remap_id as i32);
-            state.trace.push(Op::CreateBTree(root_remap_id))
+            state
+                .current_context_mut()
+                .trace
+                .push(Op::CreateBTree(root_remap_id))
+        }
+        OpCode::OpSetCookie => {
+            let db = op.p1;
+            let value = op.p3;
+            let cookie = op.p2;
+            state
+                .current_context_mut()
+                .trace
+                .push(Op::SetCookie { db, value, cookie });
         }
         OpCode::OpOpenWrite => {
             // p1 contains a cursor for the table/index whose root is in p2. We create the mapping
-            state.cursor_to_root.insert(op.p1, op.p2);
+            state
+                .current_context_mut()
+                .cursor_to_root
+                .insert(op.p1, op.p2);
         }
         OpCode::OpInsert => {
             // p1 contains the cursor we want to insert to, we get the corresponding table root
             // mapping
-            let root = state
+            let root = *state
+                .current_context_mut()
                 .cursor_to_root
                 .get(&op.p1)
                 .expect("unknown cursor root!");
-            let root = if *root == 1 {
+            let root = if root == 1 {
+                // This is an insert to the system table, we need to patch it.
                 TableRoot::System
             } else {
                 let mapped_root = state.btree_root_remap.get(&root).expect("unkown root!");
@@ -334,7 +474,7 @@ pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_in
 
             let data_reg = vdbe.vdbe_get_reg(op.p2);
             let data = unsafe { std::slice::from_raw_parts(data_reg.z, data_reg.n as usize) };
-            state.trace.push(Op::Record {
+            state.current_context_mut().trace.push(Op::Record {
                 id,
                 root,
                 data: data.to_vec(),

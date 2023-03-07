@@ -713,6 +713,8 @@ int deregister_wasm_function(sqlite3 *db, const char *zName);
 #endif
 
 extern int replication_step(Vdbe*, Op*);
+extern void replication_enter_context(Vdbe*);
+extern void replication_exit_context(Vdbe*);
 
 // step the replication machine before incrementing the op.
 static void increment_pOp(Op *pOp, Vdbe *v) {
@@ -754,6 +756,7 @@ int sqlite3VdbeExec(
 #endif
   /*** INSERT STACK UNION HERE ***/
 
+  replication_enter_context(p);
   assert( p->eVdbeState==VDBE_RUN_STATE );  /* sqlite3_step() verifies this */
   if( DbMaskNonZero(p->lockMask) ){
     sqlite3VdbeEnter(p);
@@ -811,7 +814,7 @@ int sqlite3VdbeExec(
 
   Op* previous = NULL;
   for(pOp=&aOp[p->pc]; 1; pOp++){
-    /* 
+    /*
      * Apply the replication with the previously executed op, so we can observe its effects
      */
     if (previous) {
@@ -8937,6 +8940,7 @@ abort_due_to_error:
   ** release the mutexes on btrees that were acquired at the
   ** top. */
 vdbe_return:
+replication_exit_context(p);
 #if defined(VDBE_PROFILE)
   if( pnCycle ){
     *pnCycle += sqlite3NProfileCnt ? sqlite3NProfileCnt : sqlite3Hwtime();

@@ -317,7 +317,6 @@ SRC = \
   $(TOP)/src/whereexpr.c \
   $(TOP)/src/whereInt.h \
   $(TOP)/src/window.c \
-  $(TOP)/src/replication.c
 
 # Source code for extensions
 #
