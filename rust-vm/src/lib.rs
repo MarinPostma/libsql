@@ -10,7 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use ffi::{sqlite3, Mem, Vdbe, VdbeOp};
+use ffi::{sqlite3, Mem, Vdbe, VdbeOp, _sqlite3GetVarint};
 
 const SQLITE_INTERNAL: usize = 2;
 
@@ -32,6 +32,7 @@ enum ReturnCode {
     SqliteRow,
 }
 
+#[derive(Serialize, Deserialize)]
 enum RowValue {
     String(String),
     Integer(u64),
@@ -87,7 +88,7 @@ enum Op {
         /// has offset 0, etc...
         /// When restoring from a log, one has to convert this offset into an actual root offset.
         root: TableRoot,
-        data: Vec<i8>,
+        row: Vec<RowValue>,
     },
     SetCookie {
         db: i32,
@@ -120,8 +121,7 @@ impl fmt::Debug for Trace {
         for op in self.ops.iter() {
             match op {
                 Op::Transaction => writeln!(f, "TX_BEGIN")?,
-                Op::Record { id, root, data } => {
-                    let row = decode_record(&data);
+                Op::Record { id, root, row } => {
                     writeln!(f, "INSERT root={root} id={id} row={row:?}")?;
                 }
                 Op::CreateBTree(i) => writeln!(f, "CREATE_BTREE root={i}")?,
@@ -137,7 +137,6 @@ impl fmt::Debug for Trace {
 
 #[derive(Debug, Default)]
 struct Context {
-    cursor_to_root: HashMap<i32, i32>,
     trace: Trace,
 }
 
@@ -155,6 +154,7 @@ impl ReplicationState {
     fn in_context(&self) -> bool {
         !self.context_stack.is_empty()
     }
+
     fn current_context_mut(&mut self) -> &mut Context {
         let ctx_id = self
             .context_stack
@@ -188,7 +188,6 @@ fn serve_log(mut rcv: mpsc::Receiver<Op>) {
     runtime.block_on(async {
         let mut log = Vec::new();
         let listener = TcpListener::bind("127.0.0.1:7890").await.unwrap();
-        dbg!();
         let mut conns = Vec::new();
         loop {
             tokio::select! {
@@ -206,7 +205,6 @@ fn serve_log(mut rcv: mpsc::Receiver<Op>) {
                     }
                 },
                 Ok((s, _)) = listener.accept() => {
-                    dbg!();
                     let mut conn = (0, s);
                     if update_conn(&mut conn, &log).await {
                         conns.push(conn);
@@ -352,7 +350,7 @@ impl RecordType {
 }
 
 fn decode_record(data: &[i8]) -> Vec<RowValue> {
-    let (data_offset, ty_offset) = sqlite_get_var_int(data);
+    let (data_offset, ty_offset) = dbg!(sqlite_get_var_int(data));
     let mut ty_slice = &data[ty_offset as usize..data_offset as usize];
     let mut data_slice =
         unsafe { &*((&data[data_offset as usize..]) as *const [i8] as *const [u8]) };
@@ -362,6 +360,7 @@ fn decode_record(data: &[i8]) -> Vec<RowValue> {
         ty_slice = &ty_slice[size as usize..];
         let ty = RecordType::from_u64(ty);
         let data_len = ty.size();
+        dbg!(&ty);
         let value = match ty {
             RecordType::Null => RowValue::Null,
             RecordType::Int8 => RowValue::Integer(u8::from_ne_bytes(
@@ -442,28 +441,8 @@ pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_in
                 .trace
                 .push(Op::SetCookie { db, value, cookie });
         }
-        OpCode::OpOpenWrite => {
-            // p1 contains a cursor for the table/index whose root is in p2. We create the mapping
-            state
-                .current_context_mut()
-                .cursor_to_root
-                .insert(op.p1, op.p2);
-        }
         OpCode::OpInsert => {
             // p1 contains the cursor we want to insert to, we get the corresponding table root
-            // mapping
-            let root = *state
-                .current_context_mut()
-                .cursor_to_root
-                .get(&op.p1)
-                .expect("unknown cursor root!");
-            let root = if root == 1 {
-                // This is an insert to the system table, we need to patch it.
-                TableRoot::System
-            } else {
-                let mapped_root = state.btree_root_remap.get(&root).expect("unkown root!");
-                TableRoot::User(*mapped_root)
-            };
             if op.p4type == P4_TABLE {
                 let table = unsafe { &op.p4.pTab };
                 let name = unsafe { CStr::from_ptr((**table).zName) };
@@ -474,11 +453,25 @@ pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_in
 
             let data_reg = vdbe.vdbe_get_reg(op.p2);
             let data = unsafe { std::slice::from_raw_parts(data_reg.z, data_reg.n as usize) };
-            state.current_context_mut().trace.push(Op::Record {
-                id,
-                root,
-                data: data.to_vec(),
-            })
+            let row = decode_record(data);
+            let root = unsafe { (**vdbe.apCsr.offset(op.p1 as isize)).pgnoRoot };
+            // mapping
+            if root == 1 {
+                // This is an insert to the system table, we need to patch it.
+                state.current_context_mut().trace.push(Op::Record {
+                    id,
+                    root: TableRoot::System,
+                    row,
+                });
+            } else {
+                let mapped_root = state.btree_root_remap.get(&(root as _)).expect("unkown root!");
+                let root = TableRoot::User(*mapped_root);
+                state.current_context_mut().trace.push(Op::Record {
+                    id,
+                    root,
+                    row,
+                });
+            }
         }
         _ => (),
     }
@@ -716,140 +709,7 @@ const SLOT_4_2_0: u32 = 0xf01fc07f;
 ///
 /// This will need some fuzzing with the c version as oracle.
 fn sqlite_get_var_int(data: &[i8]) -> (u64, u8) {
-    let mut temp = data;
-    let (mut a, mut b, mut s);
-
-    if temp[0] >= 0 {
-        return (data[0] as u64, 1);
-    }
-
-    if temp[1] >= 0 {
-        let val = (((data[0] & 0x7f) as u32) << 7) | (data[1] as u32);
-        return (val as u64, 2);
-    }
-
-    a = (temp[0] as u32) << 14;
-    b = temp[1] as u32;
-    temp = &temp[2..];
-    a |= temp[0] as u32;
-    /* a: p0<<14 | p2 (unmasked) */
-    if a & 0x80 == 0 {
-        a &= SLOT_2_0;
-        b &= 0x7f;
-        b = b << 7;
-        a |= b;
-        return (a as u64, 3);
-    }
-
-    /* CSE1 from below */
-    a &= SLOT_2_0;
-    temp = &temp[1..];
-    b = b << 14;
-    b |= temp[0] as u32;
-    /* b: p1<<14 | p3 (unmasked) */
-    if b & 0x80 == 0 {
-        b &= SLOT_2_0;
-        /* moved CSE1 up */
-        /* a &= (0x7f<<14)|(0x7f); */
-        a = a << 7;
-        a |= b;
-        return (a as u64, 4);
-    }
-
-    /* a: p0<<14 | p2 (masked) */
-    /* b: p1<<14 | p3 (unmasked) */
-    /* 1:save off p0<<21 | p1<<14 | p2<<7 | p3 (masked) */
-    /* moved CSE1 up */
-    /* a &= (0x7f<<14)|(0x7f); */
-    b &= SLOT_2_0;
-    s = a;
-    /* s: p0<<14 | p2 (masked) */
-
-    temp = &temp[1..];
-    a = a << 14;
-    a |= temp[0] as u32;
-    /* a: p0<<28 | p2<<14 | p4 (unmasked) */
-    if a & 0x80 == 0 {
-        /* we can skip these cause they were (effectively) done above
-         ** while calculating s */
-        /* a &= (0x7f<<28)|(0x7f<<14)|(0x7f); */
-        /* b &= (0x7f<<14)|(0x7f); */
-        b = b << 7;
-        a |= b;
-        s = s >> 18;
-        let val = (s as u64) << 32 | a as u64;
-        return (val, 5);
-    }
-
-    /* 2:save off p0<<21 | p1<<14 | p2<<7 | p3 (masked) */
-    s = s << 7;
-    s |= b;
-    /* s: p0<<21 | p1<<14 | p2<<7 | p3 (masked) */
-
-    temp = &temp[1..];
-    b = b << 14;
-    b |= temp[0] as u32;
-    /* b: p1<<28 | p3<<14 | p5 (unmasked) */
-    if b & 0x80 == 0 {
-        /* we can skip this cause it was (effectively) done above in calc'ing s */
-        /* b &= (0x7f<<28)|(0x7f<<14)|(0x7f); */
-        a &= SLOT_2_0;
-        a = a << 7;
-        a |= b;
-        s = s >> 18;
-        let val = (s as u64) << 32 | a as u64;
-        return (val, 6);
-    }
-
-    temp = &temp[1..];
-    a = a << 14;
-    a |= temp[0] as u32;
-    /* a: p2<<28 | p4<<14 | p6 (unmasked) */
-    if a & 0x80 == 0 {
-        a &= SLOT_4_2_0;
-        b &= SLOT_2_0;
-        b = b << 7;
-        a |= b;
-        s = s >> 11;
-        let val = (s as u64) << 32 | a as u64;
-        return (val, 7);
-    }
-
-    /* CSE2 from below */
-    a &= SLOT_2_0;
-    temp = &temp[1..];
-    b = b << 14;
-    b |= temp[0] as u32;
-    /* b: p3<<28 | p5<<14 | p7 (unmasked) */
-    if b & 0x80 == 0 {
-        b &= SLOT_4_2_0;
-        /* moved CSE2 up */
-        /* a &= (0x7f<<14)|(0x7f); */
-        a = a << 7;
-        a |= b;
-        s = s >> 4;
-        let val = (s as u64) << 32 | a as u64;
-        return (val, 8);
-    }
-
-    temp = &temp[1..];
-    a = a << 15;
-    a |= temp[0] as u32;
-    /* a: p4<<29 | p6<<15 | p8 (unmasked) */
-
-    /* moved CSE2 up */
-    /* a &= (0x7f<<29)|(0x7f<<15)|(0xff); */
-    b &= SLOT_2_0;
-    b = b << 8;
-    a |= b;
-
-    s = s << 4;
-    b = data[4] as _;
-    b &= 0x7f;
-    b = b >> 3;
-    s |= b;
-
-    let val = (s as u64) << 32 | a as u64;
-
-    return (val, 9);
+    let mut out = 0;
+    let count = unsafe { _sqlite3GetVarint(data.as_ptr() as *const _, &mut out as *mut _) };
+    (out, count)
 }

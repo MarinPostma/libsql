@@ -5057,7 +5057,7 @@ int sqlite3VListNameToNum(VList*,const char*,int);
 ** file.
 */
 int sqlite3PutVarint(unsigned char*, u64);
-u8 sqlite3GetVarint(const unsigned char *, u64 *);
+u8 _sqlite3GetVarint(const unsigned char *, u64 *);
 u8 sqlite3GetVarint32(const unsigned char *, u32 *);
 int sqlite3VarintLen(u64 v);
 
@@ -5073,7 +5073,7 @@ int sqlite3VarintLen(u64 v);
 #define putVarint32(A,B)  \
   (u8)(((u32)(B)<(u32)0x80)?(*(A)=(unsigned char)(B)),1:\
   sqlite3PutVarint((A),(B)))
-#define getVarint    sqlite3GetVarint
+#define getVarint    _sqlite3GetVarint
 #define putVarint    sqlite3PutVarint
 
 
