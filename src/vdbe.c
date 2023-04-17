@@ -716,13 +716,6 @@ extern int replication_step(Vdbe*, Op*);
 extern void replication_enter_context(Vdbe*);
 extern void replication_exit_context(Vdbe*);
 
-// step the replication machine before incrementing the op.
-static void increment_pOp(Op *pOp, Vdbe *v) {
-    printf("hello\n");
-    replication_step(v, pOp);
-    pOp++;
-}
-
 /*
 ** Execute as much of a VDBE program as we can.
 ** This is the core of sqlite3_step().

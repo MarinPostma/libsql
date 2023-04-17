@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 use core::fmt::{self, Display};
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{c_int, c_void, CStr};
+use std::mem::MaybeUninit;
 
 use num_enum::TryFromPrimitive;
 use serde::{Deserialize, Serialize};
@@ -10,7 +12,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use ffi::{sqlite3, Mem, Vdbe, VdbeOp, _sqlite3GetVarint};
+use ffi::{sqlite3, Mem, Vdbe, VdbeOp, _sqlite3GetVarint, MEM_Undefined};
+
+use crate::ffi::{MEM_Blob, MEM_Zero};
 
 const SQLITE_INTERNAL: usize = 2;
 
@@ -47,9 +51,13 @@ impl fmt::Debug for RowValue {
             Self::String(s) => write!(f, "'{s}'"),
             Self::Integer(n) => write!(f, "{n}"),
             Self::Blob(b) => {
-                #[allow(deprecated)]
-                let b64 = base64::encode(b);
-                write!(f, "b64:{b64}")
+                if let Ok(s) = std::str::from_utf8(&b) {
+                    write!(f, "{s}")
+                } else {
+                    #[allow(deprecated)]
+                    let b64 = base64::encode(b);
+                    write!(f, "b64:{b64}")
+                }
             }
             Self::Float(x) => write!(f, "{x}"),
             Self::Null => write!(f, "Null"),
@@ -79,23 +87,27 @@ impl Display for TableRoot {
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Op {
-    Transaction,
-    Record {
+    Transaction {
+        p1: i32,
+        p2: i32,
+    },
+    Insert {
         id: u32,
-        /// A number representing the root of the tree into which to insert the row.
-        /// Since there is no guarantee over what will be the actual root page returned by the
-        /// execution of OP_CreateBtree, we store an offset instead: the first call to CreateBTree
-        /// has offset 0, etc...
-        /// When restoring from a log, one has to convert this offset into an actual root offset.
-        root: TableRoot,
-        row: Vec<RowValue>,
+        root: u32,
+        /// sqlite record,
+        data: Vec<u8>,
+        /// number of trailing 0 in data, taken from mem.u.nZero
+        n_zero: u32,
     },
     SetCookie {
         db: i32,
         value: i32,
         cookie: i32,
     },
-    CreateBTree(usize),
+    CreateBTree {
+        p1: i32,
+        p3: i32,
+    },
 }
 
 #[derive(Default)]
@@ -114,17 +126,138 @@ impl Trace {
     fn push(&mut self, op: Op) {
         self.ops.push(op);
     }
+
+    /// return the number of registers to allocate for this trace
+    fn count_registers(&self) -> usize {
+        let mut num_regs = 0;
+        // each Insert or CreateBTree require one register to the record
+        num_regs += self
+            .ops
+            .iter()
+            .filter(|r| matches!(r, Op::Insert { .. } | Op::CreateBTree { .. }))
+            .count();
+
+        // additionally, we need 1 reg for each opened cursor
+        num_regs += self
+            .ops
+            .iter()
+            .fold(HashSet::new(), |mut set, op| {
+                if let Op::Insert { root, .. } = op {
+                    set.insert(root);
+                }
+                set
+            })
+            .len();
+
+        num_regs
+    }
+
+    fn gen_code(self, vdbe: *mut Vdbe) {
+        let num_regs = self.count_registers();
+        let mut regs: Vec<ffi::Mem> = Vec::with_capacity(num_regs);
+        // perform some partial initialization of the registers
+        let db = unsafe { (&*vdbe).db };
+        for _ in 0..num_regs {
+            let mut mem: Mem = unsafe { MaybeUninit::zeroed().assume_init() };
+            mem.db = db;
+            mem.flags = MEM_Undefined as _;
+
+            regs.push(mem);
+        }
+
+        let mut cursors = HashMap::new();
+        let mut current_reg = 0;
+        for op in self.ops.into_iter() {
+            match op {
+                Op::Transaction { p1, p2 } => unsafe {
+                    ffi::sqlite3VdbeAddOp2(vdbe, OpCode::OpTransaction as _, p1, p2);
+                },
+                Op::Insert {
+                    id,
+                    root,
+                    data,
+                    n_zero,
+                } => {
+                    // 1) make row
+                    let mut flags = MEM_Blob;
+                    if n_zero != 0 {
+                        flags |= MEM_Zero;
+                    }
+                    let reg = &mut regs[current_reg];
+                    reg.u = ffi::sqlite3_value_MemValue { nZero: n_zero as _ };
+                    reg.z = data.as_ptr() as _;
+                    reg.n = data.len() as _;
+                    reg.flags = flags as _;
+                    let reg = regs.len();
+
+                    // TODO: don't leak!!
+                    std::mem::forget(data);
+                    // 2) put row in available register
+                    let next_cursor = cursors.len();
+                    let cursor = match cursors.entry(root) {
+                        Entry::Occupied(e) => *e.get(),
+                        Entry::Vacant(e) => {
+                            e.insert(next_cursor);
+                            unsafe {
+                                ffi::sqlite3VdbeAddOp2(
+                                    vdbe,
+                                    OpCode::OpOpenWrite as _,
+                                    next_cursor as _,
+                                    root as _,
+                                );
+                            }
+                            next_cursor
+                        }
+                    };
+                    // 3) add insert intruction to insert row stored at index
+                    unsafe {
+                        ffi::sqlite3VdbeAddOp3(
+                            vdbe,
+                            OpCode::OpInsert as _,
+                            cursor as _,
+                            reg as _,
+                            id as _,
+                        );
+                    }
+
+                    current_reg += 1;
+                }
+                Op::SetCookie { db, value, cookie } => {
+                    unsafe {
+                        ffi::sqlite3VdbeAddOp3(vdbe, OpCode::OpSetCookie as _, db as _, cookie as _, value as _);
+                    }
+                },
+                Op::CreateBTree { p1, p3 } => {
+                    unsafe {
+                        ffi::sqlite3VdbeAddOp3(vdbe, OpCode::OpSetCookie as _, p1 as _, current_reg as _, p3 as _);
+                    }
+                    current_reg += 1;
+                },
+            }
+        }
+
+        unsafe {
+            ffi::sqlite3VdbeAddOp0(vdbe, OpCode::OpHalt as _);
+        }
+
+        let vdbe = unsafe { &mut *vdbe };
+        vdbe.nMem = regs.len() as _;
+        vdbe.aMem = regs.as_mut_ptr();
+        // TODO handle leak!!
+        std::mem::forget(regs);
+    }
 }
 
 impl fmt::Debug for Trace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for op in self.ops.iter() {
             match op {
-                Op::Transaction => writeln!(f, "TX_BEGIN")?,
-                Op::Record { id, root, row } => {
+                Op::Transaction { .. } => writeln!(f, "TX_BEGIN")?,
+                Op::Insert { id, root, data, .. } => unsafe {
+                    let row = decode_record(std::mem::transmute(data.as_slice()));
                     writeln!(f, "INSERT root={root} id={id} row={row:?}")?;
-                }
-                Op::CreateBTree(i) => writeln!(f, "CREATE_BTREE root={i}")?,
+                },
+                Op::CreateBTree { .. } => writeln!(f, "CREATE_BTREE")?,
                 Op::SetCookie { db, value, cookie } => {
                     writeln!(f, "SET_COOKIE db={db}, value={value}, cookie={cookie}")?;
                 }
@@ -161,7 +294,7 @@ impl ReplicationState {
             .last()
             .expect("replication method called out of any context");
         self.contexts
-            .get_mut(dbg!(ctx_id))
+            .get_mut(ctx_id)
             .expect("invalid replication state")
     }
 }
@@ -247,7 +380,7 @@ pub extern "C" fn replication_enter_context(vdbe: *const Vdbe) {
 
     let ctx = Context::default();
     state.contexts.insert(ctx_id, ctx);
-    state.context_stack.push(dbg!(ctx_id));
+    state.context_stack.push(ctx_id);
 }
 
 #[no_mangle]
@@ -257,7 +390,7 @@ pub extern "C" fn replication_exit_context(vdbe: *const Vdbe) {
     let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
     if state.in_context() {
         let last = state.context_stack.pop().unwrap();
-        state.contexts.remove(dbg!(&last));
+        state.contexts.remove(&last);
     }
 }
 
@@ -350,7 +483,7 @@ impl RecordType {
 }
 
 fn decode_record(data: &[i8]) -> Vec<RowValue> {
-    let (data_offset, ty_offset) = dbg!(sqlite_get_var_int(data));
+    let (data_offset, ty_offset) = sqlite_get_var_int(data);
     let mut ty_slice = &data[ty_offset as usize..data_offset as usize];
     let mut data_slice =
         unsafe { &*((&data[data_offset as usize..]) as *const [i8] as *const [u8]) };
@@ -360,7 +493,6 @@ fn decode_record(data: &[i8]) -> Vec<RowValue> {
         ty_slice = &ty_slice[size as usize..];
         let ty = RecordType::from_u64(ty);
         let data_len = ty.size();
-        dbg!(&ty);
         let value = match ty {
             RecordType::Null => RowValue::Null,
             RecordType::Int8 => RowValue::Integer(u8::from_ne_bytes(
@@ -419,19 +551,15 @@ pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_in
     let code: OpCode = op.opcode.try_into().unwrap();
     match code {
         OpCode::OpTransaction => {
-            state.current_context_mut().trace.push(Op::Transaction);
+            state.current_context_mut().trace.push(Op::Transaction {
+                p1: op.p1,
+                p2: op.p2,
+            });
         }
-        OpCode::OpCreateBtree => {
-            let root = unsafe { vdbe.vdbe_get_reg(op.p2).u.i };
-            let root_remap_id = state.btree_root_remap.len();
-            state
-                .btree_root_remap
-                .insert(root as i32, root_remap_id as i32);
-            state
-                .current_context_mut()
-                .trace
-                .push(Op::CreateBTree(root_remap_id))
-        }
+        OpCode::OpCreateBtree => state.current_context_mut().trace.push(Op::CreateBTree {
+            p1: op.p1,
+            p3: op.p3,
+        }),
         OpCode::OpSetCookie => {
             let db = op.p1;
             let value = op.p3;
@@ -452,26 +580,16 @@ pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_in
             let id = unsafe { vdbe.vdbe_get_reg(op.p3).u.i as u32 };
 
             let data_reg = vdbe.vdbe_get_reg(op.p2);
-            let data = unsafe { std::slice::from_raw_parts(data_reg.z, data_reg.n as usize) };
-            let row = decode_record(data);
+            let data =
+                unsafe { std::slice::from_raw_parts(data_reg.z as *const u8, data_reg.n as usize) };
             let root = unsafe { (**vdbe.apCsr.offset(op.p1 as isize)).pgnoRoot };
             // mapping
-            if root == 1 {
-                // This is an insert to the system table, we need to patch it.
-                state.current_context_mut().trace.push(Op::Record {
-                    id,
-                    root: TableRoot::System,
-                    row,
-                });
-            } else {
-                let mapped_root = state.btree_root_remap.get(&(root as _)).expect("unkown root!");
-                let root = TableRoot::User(*mapped_root);
-                state.current_context_mut().trace.push(Op::Record {
-                    id,
-                    root,
-                    row,
-                });
-            }
+            state.current_context_mut().trace.push(Op::Insert {
+                id,
+                root,
+                data: data.to_vec(),
+                n_zero: unsafe { data_reg.u.nZero as _ },
+            });
         }
         _ => (),
     }
