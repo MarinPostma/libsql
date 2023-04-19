@@ -1744,7 +1744,7 @@ struct sqlite3 {
   libsql_wasm_ctx wasm;        /* WebAssembly runtime context */
 #endif
   libsql_wal_methods* pWalMethods; /* Custom WAL methods */
-  void* replication_context;
+  void* replication_state;
 };
 
 /*

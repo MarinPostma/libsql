@@ -3729,8 +3729,8 @@ int libsql_open(
 );
 
 LIBSQL_API int libsql_try_initialize_wasm_func_table(sqlite3 *db);
-
-int replicate(sqlite3* db);
+LIBSQL_API int init_replication_callback(sqlite3 *db, int (*cb)(void*, const char*, int), void* user_data);
+LIBSQL_API int replicate(sqlite3 *db, const char *data, int len);
 
 /*
 ** CAPI3REF: Obtain Values For URI Parameters

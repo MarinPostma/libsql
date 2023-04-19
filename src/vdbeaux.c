@@ -240,7 +240,7 @@ static SQLITE_NOINLINE int growOp3(Vdbe *p, int op, int p1, int p2, int p3){
   assert( p->nOpAlloc>p->nOp );
   return sqlite3VdbeAddOp3(p, op, p1, p2, p3);
 }
-int sqlite3VdbeAddOp3(Vdbe *p, int op, int p1, int p2, int p3){
+SQLITE_API int sqlite3VdbeAddOp3(Vdbe *p, int op, int p1, int p2, int p3){
   int i;
   VdbeOp *pOp;
 
@@ -279,13 +279,13 @@ int sqlite3VdbeAddOp3(Vdbe *p, int op, int p1, int p2, int p3){
 #endif
   return i;
 }
-int sqlite3VdbeAddOp0(Vdbe *p, int op){
+SQLITE_API int sqlite3VdbeAddOp0(Vdbe *p, int op){
   return sqlite3VdbeAddOp3(p, op, 0, 0, 0);
 }
-int sqlite3VdbeAddOp1(Vdbe *p, int op, int p1){
+SQLITE_API int sqlite3VdbeAddOp1(Vdbe *p, int op, int p1){
   return sqlite3VdbeAddOp3(p, op, p1, 0, 0);
 }
-int sqlite3VdbeAddOp2(Vdbe *p, int op, int p1, int p2){
+SQLITE_API int sqlite3VdbeAddOp2(Vdbe *p, int op, int p1, int p2){
   return sqlite3VdbeAddOp3(p, op, p1, p2, 0);
 }
 
@@ -336,7 +336,7 @@ skip_op_resultrow:
 /*
 ** Add an opcode that includes the p4 value as a pointer.
 */
-int sqlite3VdbeAddOp4(
+SQLITE_API int sqlite3VdbeAddOp4(
   Vdbe *p,            /* Add the opcode to this VM */
   int op,             /* The new opcode */
   int p1,             /* The P1 operand */

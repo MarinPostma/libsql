@@ -6844,6 +6844,7 @@ case OP_CreateBtree: {          /* out2 */
   rc = sqlite3BtreeCreateTable(pDb->pBt, &pgno, pOp->p3);
   if( rc ) goto abort_due_to_error;
   pOut->u.i = pgno;
+  printf("pageno: %d", pgno);
   break;
 }
 

@@ -2908,7 +2908,7 @@ libsql_wal_methods* libsql_wal_methods_find(const char *zName) {
 /*
 ** This function is used to parse both URIs and non-URI filenames passed by the
 ** user to API functions sqlite3_open() or sqlite3_open_v2(), and for database
-** URIs specified as part of ATTACH statements.
+** URIs specified as part of ATTACH statements.nt
 **
 ** The first argument to this function is the name of the VFS to use (or
 ** a NULL to signify the default VFS) if the URI does not contain a "vfs=xxx"
@@ -3198,8 +3198,6 @@ static const char *uriParameter(const char *zFilename, const char *zParam){
 ** sqlite3_open() and sqlite3_open16(). The database filename "zFilename"
 ** is UTF-8 encoded.
 */
-
-extern void* replication_state_init();
 
 static int openDatabase(
   const char *zFilename, /* Database filename UTF-8 encoded */
@@ -3553,8 +3551,6 @@ opendb_out:
   }
 #endif
   sqlite3_free_filename(zOpen);
-
-  (*ppDb)->replication_context = replication_state_init();
 
   return rc;
 }
@@ -4953,3 +4949,35 @@ const char *sqlite3_compileoption_get(int N){
   return 0;
 }
 #endif /* SQLITE_OMIT_COMPILEOPTION_DIAGS */
+
+extern void* replication_state_init(int (*)(void*, const char*, int), void*);
+int init_replication_callback(sqlite3 *db, int (*cb)(void*, const char*, int), void* user_data) {
+    if (db->replication_state != NULL) {
+        return SQLITE_ERROR;
+    }
+    void* state = replication_state_init(cb, user_data);
+    db->replication_state = state;
+    return 0;
+}
+
+extern int prepare_program(const char*, int, Vdbe*);
+int replicate(sqlite3 *db, const char *data, int len) {
+    int rc;
+  if( !sqlite3SafetyCheckOk(db)){
+    return SQLITE_MISUSE_BKPT;
+  }
+  sqlite3_mutex_enter(db->mutex);
+  sqlite3BtreeEnterAll(db);
+
+  Parse dummy= { 0 };
+  dummy.db = db;
+  Vdbe *vdbe = sqlite3VdbeCreate(&dummy);
+  prepare_program(data,len, vdbe);
+  sqlite3VdbeExec(vdbe);
+  sqlite3BtreeLeaveAll(db);
+  rc = sqlite3ApiExit(db, rc);
+  assert( (rc&db->errMask)==rc );
+  db->busyHandler.nBusy = 0;
+  sqlite3_mutex_leave(db->mutex);
+  return rc;
+}

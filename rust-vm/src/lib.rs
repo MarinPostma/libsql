@@ -1,22 +1,27 @@
-#![allow(dead_code)]
-
 use core::fmt::{self, Display};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::ffi::{c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::mem::MaybeUninit;
 
 use num_enum::TryFromPrimitive;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 
-use ffi::{sqlite3, Mem, Vdbe, VdbeOp, _sqlite3GetVarint, MEM_Undefined};
+use ffi::{MEM_Undefined, Mem, Vdbe, VdbeOp, _sqlite3GetVarint};
 
-use crate::ffi::{MEM_Blob, MEM_Zero};
+use crate::ffi::{MEM_Blob, MEM_Zero, MEM_Int};
 
-const SQLITE_INTERNAL: usize = 2;
+macro_rules! state_or_return {
+    ($vdbe:expr, $ret:expr) => {
+        unsafe {
+            let db = &mut *$vdbe.db;
+            if db.replication_state.is_null() {
+                return $ret;
+            }
+            &mut *(db.replication_state as *mut ReplicationState)
+        }
+    };
+}
 
 pub mod ffi {
     #![allow(non_upper_case_globals)]
@@ -24,16 +29,6 @@ pub mod ffi {
     #![allow(non_snake_case)]
     #![allow(improper_ctypes)]
     include!(concat!(env!("OUT_DIR"), "/sqliteInt.rs"));
-}
-
-#[derive(Debug)]
-enum Value {
-    Integer(c_int),
-    Null,
-}
-
-enum ReturnCode {
-    SqliteRow,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -63,11 +58,6 @@ impl fmt::Debug for RowValue {
             Self::Null => write!(f, "Null"),
         }
     }
-}
-
-#[derive(Debug)]
-struct Row {
-    values: Vec<RowValue>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,50 +100,46 @@ enum Op {
     },
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 struct Trace {
     ops: Vec<Op>,
 }
 
 impl Trace {
-    fn new() -> Self {
-        Self { ops: Vec::new() }
-    }
-    fn clear(&mut self) {
-        self.ops.clear();
-    }
-
     fn push(&mut self, op: Op) {
         self.ops.push(op);
     }
 
     /// return the number of registers to allocate for this trace
     fn count_registers(&self) -> usize {
-        let mut num_regs = 0;
-        // each Insert or CreateBTree require one register to the record
-        num_regs += self
+        let mut roots = HashSet::new();
+         self
             .ops
             .iter()
-            .filter(|r| matches!(r, Op::Insert { .. } | Op::CreateBTree { .. }))
-            .count();
-
-        // additionally, we need 1 reg for each opened cursor
-        num_regs += self
-            .ops
-            .iter()
-            .fold(HashSet::new(), |mut set, op| {
-                if let Op::Insert { root, .. } = op {
-                    set.insert(root);
-                }
-                set
+            .map(|r| match r {
+                Op::Transaction { .. } => 0,
+                Op::Insert { root, .. } => {
+                    // we need:
+                    // - 1 reg for data
+                    // - 1 reg for row id
+                    // - 1 reg if we need to open a cursor for this row
+                    if !roots.contains(&root) {
+                        roots.insert(root);
+                        3
+                    } else {
+                        2
+                    }
+                },
+                Op::SetCookie { .. } => 0,
+                Op::CreateBTree { .. } => 1,
             })
-            .len();
-
-        num_regs
+            .sum()
     }
 
     fn gen_code(self, vdbe: *mut Vdbe) {
+        dbg!(&self);
         let num_regs = self.count_registers();
+        dbg!(num_regs);
         let mut regs: Vec<ffi::Mem> = Vec::with_capacity(num_regs);
         // perform some partial initialization of the registers
         let db = unsafe { (&*vdbe).db };
@@ -166,7 +152,8 @@ impl Trace {
         }
 
         let mut cursors = HashMap::new();
-        let mut current_reg = 0;
+        // the register 0 is reserved for the cursor
+        let mut current_reg = self.ops.iter().any(|op| matches!(op, Op::Insert { .. })) as usize;
         for op in self.ops.into_iter() {
             match op {
                 Op::Transaction { p1, p2 } => unsafe {
@@ -188,7 +175,13 @@ impl Trace {
                     reg.z = data.as_ptr() as _;
                     reg.n = data.len() as _;
                     reg.flags = flags as _;
-                    let reg = regs.len();
+                    let data_reg = current_reg;
+                    current_reg += 1;
+
+                    let id_reg = current_reg;
+                    regs[id_reg].u.i = id as _;
+                    regs[id_reg].flags |= MEM_Int as u16;
+                    current_reg += 1;
 
                     // TODO: don't leak!!
                     std::mem::forget(data);
@@ -215,24 +208,33 @@ impl Trace {
                             vdbe,
                             OpCode::OpInsert as _,
                             cursor as _,
-                            reg as _,
-                            id as _,
+                            data_reg as _,
+                            id_reg as _,
                         );
                     }
 
-                    current_reg += 1;
                 }
-                Op::SetCookie { db, value, cookie } => {
-                    unsafe {
-                        ffi::sqlite3VdbeAddOp3(vdbe, OpCode::OpSetCookie as _, db as _, cookie as _, value as _);
-                    }
+                Op::SetCookie { db, value, cookie } => unsafe {
+                    ffi::sqlite3VdbeAddOp3(
+                        vdbe,
+                        OpCode::OpSetCookie as _,
+                        db as _,
+                        cookie as _,
+                        value as _,
+                    );
                 },
                 Op::CreateBTree { p1, p3 } => {
                     unsafe {
-                        ffi::sqlite3VdbeAddOp3(vdbe, OpCode::OpSetCookie as _, p1 as _, current_reg as _, p3 as _);
+                        ffi::sqlite3VdbeAddOp3(
+                            vdbe,
+                            OpCode::OpCreateBtree as _,
+                            p1 as _,
+                            current_reg as _,
+                            p3 as _,
+                        );
                     }
                     current_reg += 1;
-                },
+                }
             }
         }
 
@@ -243,8 +245,13 @@ impl Trace {
         let vdbe = unsafe { &mut *vdbe };
         vdbe.nMem = regs.len() as _;
         vdbe.aMem = regs.as_mut_ptr();
+        vdbe.nCursor = cursors.len() as _;
+        let mut ap_csr = vec![std::ptr::null_mut(); cursors.len()];
+        vdbe.apCsr = ap_csr.as_mut_ptr() as _;
+        vdbe.pc = 0;
         // TODO handle leak!!
         std::mem::forget(regs);
+        std::mem::forget(ap_csr);
     }
 }
 
@@ -273,14 +280,12 @@ struct Context {
     trace: Trace,
 }
 
-#[derive(Debug)]
 struct ReplicationState {
-    /// maps a register to a node in the current context
-    btree_root_remap: HashMap<i32, i32>,
     contexts: HashMap<i32, Context>,
     context_stack: Vec<i32>,
     context_ids: i32,
-    logger: mpsc::Sender<Op>,
+    frame_cb: extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int,
+    user_data: *mut c_void,
 }
 
 impl ReplicationState {
@@ -299,72 +304,29 @@ impl ReplicationState {
     }
 }
 
-async fn update_conn(conn: &mut (usize, TcpStream), log: &[Op]) -> bool {
-    let to_send = &log[conn.0..];
-    let mut sent = 0;
-    for op in to_send {
-        let data = bincode::serialize(op).unwrap();
-        if conn.1.write_all(&data).await.is_err() {
-            return false;
-        }
-
-        sent += 1;
-    }
-
-    conn.0 += sent;
-
-    true
-}
-
-fn serve_log(mut rcv: mpsc::Receiver<Op>) {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async {
-        let mut log = Vec::new();
-        let listener = TcpListener::bind("127.0.0.1:7890").await.unwrap();
-        let mut conns = Vec::new();
-        loop {
-            tokio::select! {
-                Some(e) = rcv.recv() => {
-                    log.push(e);
-                    let mut to_remove = Vec::new();
-                    for (i, conn) in conns.iter_mut().enumerate() {
-                        if !update_conn(conn, &log).await {
-                            to_remove.push(i);
-                        }
-                    }
-
-                    for i in to_remove {
-                        conns.remove(i);
-                    }
-                },
-                Ok((s, _)) = listener.accept() => {
-                    let mut conn = (0, s);
-                    if update_conn(&mut conn, &log).await {
-                        conns.push(conn);
-                    }
-                },
-                else => break
-            }
-        }
-    });
-}
-
 #[no_mangle]
-pub extern "C" fn replication_state_init() -> *mut c_void {
-    let (sender, receiver) = mpsc::channel(512);
+pub extern "C" fn replication_state_init(
+    cb: extern "C" fn(*mut c_void, *const c_char, c_int) -> c_int,
+    user_data: *mut c_void,
+) -> *mut c_void {
     let state = Box::new(ReplicationState {
-        btree_root_remap: HashMap::new(),
         contexts: HashMap::new(),
         context_stack: Vec::new(),
         context_ids: 0,
-        logger: sender,
+        frame_cb: cb,
+        user_data,
     });
-
-    std::thread::spawn(move || serve_log(receiver));
 
     let ptr = Box::leak(state) as *mut _;
 
     ptr as _
+}
+
+#[no_mangle]
+pub extern "C" fn prepare_program(trace: *const u8, len: u32, vdbe: *mut Vdbe) {
+    let bytes = unsafe { std::slice::from_raw_parts(trace, len as usize) };
+    let trace: Trace = bincode::deserialize(bytes).unwrap();
+    trace.gen_code(vdbe);
 }
 
 /// Enter a vdbe context. Returns a new context_id
@@ -373,7 +335,7 @@ pub extern "C" fn replication_enter_context(vdbe: *const Vdbe) {
     println!("entering context");
     let vdbe = unsafe { &*vdbe };
     // we are only interested in writes
-    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    let state = state_or_return!(vdbe, ());
     // this is not good, we need a proper id
     let ctx_id = state.context_ids;
     state.context_ids = state.context_ids.wrapping_add(1);
@@ -387,7 +349,7 @@ pub extern "C" fn replication_enter_context(vdbe: *const Vdbe) {
 pub extern "C" fn replication_exit_context(vdbe: *const Vdbe) {
     println!("exiting context");
     let vdbe = unsafe { &*vdbe };
-    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    let state = state_or_return!(vdbe, ());
     if state.in_context() {
         let last = state.context_stack.pop().unwrap();
         state.contexts.remove(&last);
@@ -402,28 +364,26 @@ pub extern "C" fn replication_state_destroy(state: *mut c_void) {
 #[no_mangle]
 pub extern "C" fn replication_post_commit_cleanup(vdbe: *mut Vdbe) {
     let vdbe = unsafe { &*vdbe };
-    let _state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    let _state = state_or_return!(vdbe, ());
     println!("post commit called");
 }
 
 #[no_mangle]
 pub extern "C" fn replication_pre_commit(vdbe: *const Vdbe) -> c_int {
     let vdbe = unsafe { &*vdbe };
-    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+    let state = state_or_return!(vdbe, 0);
+    if vdbe.readOnly() != 0 {
+        return 0;
+    }
     if state.in_context() {
         let ctx = state.current_context_mut();
         println!("Trace:\n {:?}", ctx.trace);
         let trace = std::mem::take(&mut ctx.trace);
-        for op in trace.ops {
-            state.logger.blocking_send(op).unwrap();
-        }
+        dbg!(&trace);
+        let data = bincode::serialize(&trace).unwrap();
+        (state.frame_cb)(state.user_data, data.as_ptr() as _, data.len() as _);
     }
     0
-}
-
-// takes a db and apply a stream of logical frames to it.
-pub fn replicate(_db: *mut sqlite3) {
-    todo!()
 }
 
 #[derive(Debug)]
@@ -458,7 +418,7 @@ impl RecordType {
             9 => Self::One,
             10 | 11 => Self::Reserved,
             n if n >= 12 && n % 2 == 0 => Self::Blob((n as usize - 12) / 2),
-            n if n >= 13 && n % 2 != 0 => Self::Blob((n as usize - 13) / 2),
+            n if n >= 13 && n % 2 != 0 => Self::Text((n as usize - 13) / 2),
             _ => unreachable!(),
         }
     }
@@ -543,12 +503,19 @@ fn decode_record(data: &[i8]) -> Vec<RowValue> {
 #[no_mangle]
 pub extern "C" fn replication_step(vdbe: *const Vdbe, op: *const VdbeOp) -> c_int {
     let vdbe = unsafe { &*vdbe };
-    let state = unsafe { &mut *((*vdbe.db).replication_context as *mut ReplicationState) };
+
+    let state = state_or_return!(vdbe, 0);
+
     if !state.in_context() {
         return 0;
     }
+    if vdbe.readOnly() == 1 {
+        return 0;
+    }
+
     let op = unsafe { &*op };
     let code: OpCode = op.opcode.try_into().unwrap();
+    dbg!(&code);
     match code {
         OpCode::OpTransaction => {
             state.current_context_mut().trace.push(Op::Transaction {
@@ -606,24 +573,7 @@ impl Vdbe {
     }
 }
 
-const P4_NOTUSED: i8 = 0; /* The P4 parameter is not used */
-const P4_TRANSIENT: i8 = 0; /* P4 is a pointer to a transient string */
-const P4_STATIC: i8 = -1; /* Pointer to a static string */
-const P4_COLLSEQ: i8 = -2; /* P4 is a pointer to a CollSeq structure */
-const P4_INT32: i8 = -3; /* P4 is a 32-bit signed integer */
-const P4_SUBPROGRAM: i8 = -4; /* P4 is a pointer to a SubProgram structure */
 const P4_TABLE: i8 = -5; /* P4 is a pointer to a Table structure */
-const P4_FREE_IF_LE: i8 = -6;
-const P4_DYNAMIC: i8 = -6; /* Pointer to memory from sqliteMalloc() */
-const P4_FUNCDEF: i8 = -7; /* P4 is a pointer to a FuncDef structure */
-const P4_KEYINFO: i8 = -8; /* P4 is a pointer to a KeyInfo structure */
-const P4_EXPR: i8 = -9; /* P4 is a pointer to an Expr tree */
-const P4_MEM: i8 = -10; /* P4 is a pointer to a Mem*    structure */
-const P4_VTAB: i8 = -11; /* P4 is a pointer to an sqlite3_vtab structure */
-const P4_REAL: i8 = -12; /* P4 is a 64-bit floating point value */
-const P4_INT64: i8 = -13; /* P4 is a 64-bit signed integer */
-const P4_INTARRAY: i8 = -14; /* P4 is a vector of 32-bit integers */
-const P4_FUNCCTX: i8 = -15; /* P4 is a pointer to an sqlite3_context object */
 
 #[derive(Debug, TryFromPrimitive, Clone, Copy)]
 #[repr(u8)]
@@ -819,9 +769,6 @@ enum OpCode {
     OpExplain = 188,
     OpAbortable = 189,
 }
-
-const SLOT_2_0: u32 = 0x001fc07f;
-const SLOT_4_2_0: u32 = 0xf01fc07f;
 
 /// translated from C
 ///

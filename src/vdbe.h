@@ -189,6 +189,8 @@ int sqlite3VdbeAddOp4Dup8(Vdbe*,int,int,int,int,const u8*,int);
 int sqlite3VdbeAddOp4Int(Vdbe*,int,int,int,int,int);
 int sqlite3VdbeAddFunctionCall(Parse*,int,int,int,int,const FuncDef*,int);
 void sqlite3VdbeEndCoroutine(Vdbe*,int);
+int sqlite3VdbeExec(Vdbe *);
+
 #if defined(SQLITE_DEBUG) && !defined(SQLITE_TEST_REALLOC_STRESS)
   void sqlite3VdbeVerifyNoMallocRequired(Vdbe *p, int N);
   void sqlite3VdbeVerifyNoResultRow(Vdbe *p);

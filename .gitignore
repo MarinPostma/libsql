@@ -56,3 +56,4 @@ test/rust_suite/target
 testfixture
 libsql
 rust-vm/target
+test-repl/target
